@@ -1,0 +1,23 @@
+{
+  "name": "pi-heads-up",
+  "version": "0.1.0",
+  "description": "Background Heads Up and You should know suggestions for Pi",
+  "type": "module",
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "files": ["src"],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  }
+}
