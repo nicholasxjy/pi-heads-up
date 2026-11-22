@@ -15,6 +15,7 @@ import {
   type ModelRegistry,
   type SessionManager,
 } from "@earendil-works/pi-coding-agent";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { REVIEW_PROMPT } from "../src/review.ts";
 
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
@@ -134,9 +135,8 @@ async function createHarness(opts: {
   const selectCalls: SelectCall[] = [];
   const notifications: Array<{ message: string; type?: "info" | "warning" | "error" }> = [];
   const sentMessages: unknown[] = [];
-  const widgetUpdates: Array<{ key: string; rendered: string | undefined }> = [];
   let editorText = "";
-  let currentWidget: string | undefined;
+  let renderWidget: ((width: number) => string) | undefined;
 
   const model = opts.model ?? makeModel();
   const modelRegistry = {
@@ -207,15 +207,13 @@ async function createHarness(opts: {
     setWorkingIndicator: () => {},
     setHiddenThinkingLabel: () => {},
     setWidget: (key, content) => {
-      let rendered: string | undefined;
+      if (key !== "pi-heads-up") return;
       if (typeof content === "function") {
-        const comp = content(null as never, themeStub as never);
-        rendered = comp.render(120).join("\n");
-      } else if (Array.isArray(content)) {
-        rendered = content.join("\n");
+        const component = content(null as never, themeStub as never);
+        renderWidget = (width) => component.render(width).join("\n");
+      } else {
+        renderWidget = content ? () => content.join("\n") : undefined;
       }
-      currentWidget = key === "pi-heads-up" ? rendered : currentWidget;
-      widgetUpdates.push({ key, rendered });
     },
     setFooter: () => {},
     setHeader: () => {},
@@ -288,8 +286,7 @@ async function createHarness(opts: {
     selectCalls,
     notifications,
     sentMessages,
-    widgetUpdates,
-    getCurrentWidget: () => currentWidget,
+    getCurrentWidget: (width = 120) => renderWidget?.(width),
     getEditorText: () => editorText,
     setEditorText: (t: string) => {
       editorText = t;
@@ -451,11 +448,49 @@ describe("pi-heads-up", { concurrency: false }, () => {
     const widget = h.getCurrentWidget();
     assert.ok(widget?.includes("Heads up"));
     assert.ok(widget?.includes("Missing scope check in auth middleware."));
-    assert.ok(widget?.includes("/heads-up for options"));
+    assert.ok(widget?.includes("/heads-up to review"));
 
     // While a note is visible, more tool turns do not start another review
     await h.emitToolTurns(6);
     assert.equal(h.completeCalls.length, 1);
+    await h.runner.emit({ type: "session_shutdown", reason: "quit" });
+  });
+
+  it("fits a wide-character note to the terminal and restores its preview when the detail menu is cancelled", async () => {
+    const note = {
+      kind: "you_should_know",
+      topic: "retry-delay",
+      title: "重试延迟会随失败次数逐步增加。".repeat(5),
+      detail: "到达上限后，后续重试使用相同的延迟。",
+    };
+    const h = await createHarness({
+      agentDir: makeTempDir(),
+      complete: async () => assistantJson(note),
+      select: async (title) => {
+        assert.equal(h.getCurrentWidget(), undefined);
+        return title.includes(note.detail) ? undefined : "Learn more";
+      },
+    });
+    await h.emitToolTurns(6);
+
+    const prefix = "✦ You should know · ";
+    const wide = h.getCurrentWidget(80)!.split("\n");
+    assert.ok(wide[0].startsWith(prefix));
+    assert.ok(wide.slice(1).every((line) => line.startsWith(" ".repeat(visibleWidth(prefix)))));
+    assert.ok(wide.every((line) => visibleWidth(line) <= 80));
+    assert.equal(wide.slice(0, -1).map((line, i) => line.slice(i === 0 ? prefix.length : visibleWidth(prefix))).join(""), note.title);
+
+    const narrow = h.getCurrentWidget(32)!.split("\n");
+    assert.equal(narrow[0], "✦ You should know");
+    assert.equal(narrow.length, 5);
+    assert.ok(narrow[3].endsWith("…"));
+    assert.equal(narrow[4], "/heads-up to review");
+    assert.ok(narrow.every((line) => visibleWidth(line) <= 32));
+
+    await h.runCommand();
+    assert.equal(h.selectCalls.length, 2);
+    assert.ok(h.selectCalls[1].title.includes(note.title));
+    assert.deepEqual(h.getCurrentWidget(32)?.split("\n"), narrow);
     await h.runner.emit({ type: "session_shutdown", reason: "quit" });
   });
 

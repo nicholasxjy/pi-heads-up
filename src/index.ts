@@ -8,12 +8,18 @@ import {
   type ExtensionContext,
   type TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { buildTranscript, noteLabel, parseNote, REVIEW_PROMPT, type Note } from "./review.ts";
 import { Store } from "./store.ts";
 
 const TOOL_ROUNDS_PER_CHECK = 6;
 const WIDGET = "pi-heads-up";
+const REVIEW_HINT = "/heads-up to review";
+const MAX_PREVIEW_LINES = 3;
+
+function noteColor(note: Note) {
+  return note.kind === "heads_up" ? "warning" : "accent";
+}
 
 export default function headsUp(pi: ExtensionAPI) {
   const store = new Store(join(getAgentDir(), "pi-heads-up", "state.sqlite"));
@@ -30,11 +36,29 @@ export default function headsUp(pi: ExtensionAPI) {
       ctx.ui.setWidget(WIDGET, undefined);
       return;
     }
-    ctx.ui.setWidget(WIDGET, (_tui, theme) => new Text(
-      `${theme.fg("accent", theme.bold(noteLabel(note)))}  ${note.title}\n${theme.fg("dim", "/heads-up for options")}`,
-      1,
-      0,
-    ));
+    ctx.ui.setWidget(WIDGET, (_tui, theme) => ({
+      invalidate() {},
+      render(width) {
+        if (width < 2) return [];
+        const label = `✦ ${noteLabel(note)}`;
+        const prefix = `${label} · `;
+        const prefixWidth = visibleWidth(prefix);
+        const indent = width - prefixWidth >= 24 ? prefixWidth : 0;
+        const bodyWidth = width - indent;
+        const padding = " ".repeat(indent);
+        const heading = theme.fg(noteColor(note), theme.bold(truncateToWidth(indent ? prefix : label, width, "…")));
+        const lines = wrapTextWithAnsi(note.title, bodyWidth);
+        const preview = lines.slice(0, MAX_PREVIEW_LINES);
+        if (lines.length > MAX_PREVIEW_LINES) {
+          const last = MAX_PREVIEW_LINES - 1;
+          preview[last] = truncateToWidth(preview[last], bodyWidth - 1, "").trimEnd() + "…";
+        }
+        const hint = bodyWidth >= REVIEW_HINT.length ? REVIEW_HINT : truncateToWidth("/heads-up", bodyWidth, "…");
+        const summary = preview.map((line, i) => (i === 0 && indent ? heading : padding) + theme.fg("muted", line));
+        if (!indent) summary.unshift(heading);
+        return [...summary, padding + theme.fg("muted", hint)];
+      },
+    }));
   }
 
   function cancelCheck(): void {
@@ -160,19 +184,26 @@ export default function headsUp(pi: ExtensionAPI) {
       }
 
       const { note, notes } = current;
-      const title = `${noteLabel(note)} · ${note.title}`;
-      let choice = await ctx.ui.select(title, ["Learn more", "Knew this already", "Dismiss"], { signal });
-      if (choice === "Learn more" && !signal.aborted && visible === current) {
-        choice = await ctx.ui.select(`${title}\n\n${note.detail}`, ["Understood", "Chat in main session", "Dismiss"], { signal });
+      const { theme } = ctx.ui;
+      const title = `${theme.fg(noteColor(note), noteLabel(note))} · ${theme.fg("text", note.title)}`;
+      ctx.ui.setWidget(WIDGET, undefined);
+      try {
+        let choice = await ctx.ui.select(title, ["Learn more", "Knew this already", "Dismiss"], { signal });
+        if (choice === "Learn more" && !signal.aborted && visible === current) {
+          const detail = `${title}\n\n${theme.fg("text", note.detail)}`;
+          choice = await ctx.ui.select(detail, ["Understood", "Chat in main session", "Dismiss"], { signal });
+        }
+        if (!choice || signal.aborted || visible !== current) return;
+        if (choice === "Knew this already" || choice === "Understood") notes.markKnown(note);
+        if (choice === "Chat in main session") {
+          const quoted = `> ${noteLabel(note)}: ${note.title}\n> ${note.detail}`;
+          ctx.ui.setEditorText([ctx.ui.getEditorText(), quoted].filter(Boolean).join("\n\n") + "\n\n");
+        }
+        visible = undefined;
+        render(ctx); // Refresh the editor after writing the quoted draft.
+      } finally {
+        if (visible === current) render(ctx);
       }
-      if (!choice || signal.aborted || visible !== current) return;
-      if (choice === "Knew this already" || choice === "Understood") notes.markKnown(note);
-      if (choice === "Chat in main session") {
-        const quoted = `> ${noteLabel(note)}: ${note.title}\n> ${note.detail}`;
-        ctx.ui.setEditorText([ctx.ui.getEditorText(), quoted].filter(Boolean).join("\n\n") + "\n\n");
-      }
-      visible = undefined;
-      render(ctx);
     },
   });
 }
