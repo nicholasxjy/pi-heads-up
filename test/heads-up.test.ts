@@ -309,7 +309,7 @@ function deferred<T>() {
 }
 
 describe("pi-heads-up", { concurrency: false }, () => {
-  it("defaults off without creating DB, toggles via /heads-up, and persists across restart", async () => {
+  it("defaults on and preserves an explicit opt-out across restart", async () => {
     const agentDir = makeTempDir();
     const dbPath = join(agentDir, "pi-heads-up", "state.sqlite");
 
@@ -320,19 +320,18 @@ describe("pi-heads-up", { concurrency: false }, () => {
     });
     await h1.runner.emit({ type: "session_start", reason: "startup" });
     await h1.emitToolTurns(6);
-    assert.equal(h1.completeCalls.length, 0);
+    assert.equal(h1.completeCalls.length, 1);
     assert.equal(existsSync(dbPath), false);
 
     await h1.runCommand("invalid");
     assert.deepEqual(h1.notifications.at(-1), { message: "Usage: /heads-up [on|off]", type: "warning" });
 
-    // Cancel toggle prompt keeps it off
     await h1.runCommand();
-    assert.equal(h1.selectCalls.at(-1)?.title, "Heads Up is off");
-    assert.deepEqual(h1.selectCalls.at(-1)?.options, ["Turn on suggestions"]);
+    assert.equal(h1.selectCalls.at(-1)?.title, "Heads Up is on · No note to review");
+    assert.deepEqual(h1.selectCalls.at(-1)?.options, ["Turn off suggestions"]);
 
-    await h1.runCommand("on");
-    assert.deepEqual(h1.notifications.at(-1), { message: "Heads Up enabled", type: "info" });
+    await h1.runCommand("off");
+    assert.deepEqual(h1.notifications.at(-1), { message: "Heads Up disabled", type: "info" });
     assert.equal(existsSync(dbPath), true);
     await h1.runner.emit({ type: "session_shutdown", reason: "quit" });
 
@@ -343,14 +342,14 @@ describe("pi-heads-up", { concurrency: false }, () => {
     });
     await h2.runner.emit({ type: "session_start", reason: "startup" });
     await h2.emitToolTurns(6);
-    assert.equal(h2.completeCalls.length, 1);
+    assert.equal(h2.completeCalls.length, 0);
 
     await h2.runCommand();
-    assert.equal(h2.selectCalls.at(-1)?.title, "Heads Up is on · No note to review");
-    assert.deepEqual(h2.selectCalls.at(-1)?.options, ["Turn off suggestions"]);
+    assert.equal(h2.selectCalls.at(-1)?.title, "Heads Up is off");
+    assert.deepEqual(h2.selectCalls.at(-1)?.options, ["Turn on suggestions"]);
 
-    await h2.runCommand("off");
-    assert.deepEqual(h2.notifications.at(-1), { message: "Heads Up disabled", type: "info" });
+    await h2.runCommand("on");
+    assert.deepEqual(h2.notifications.at(-1), { message: "Heads Up enabled", type: "info" });
     await h2.emitToolTurns(6);
     assert.equal(h2.completeCalls.length, 1);
     await h2.runner.emit({ type: "session_shutdown", reason: "quit" });
@@ -562,7 +561,6 @@ describe("pi-heads-up", { concurrency: false }, () => {
       complete: async () => assistantJson(persistentNote),
     });
     await h1.runner.emit({ type: "session_start", reason: "startup" });
-    await h1.runCommand("on");
     await h1.emitToolTurns(6);
     assert.ok(h1.getCurrentWidget()?.includes("Lock file is stale."));
     await h1.runner.emit({ type: "session_shutdown", reason: "quit" });

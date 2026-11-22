@@ -14,7 +14,7 @@ To try it for one Pi invocation, run `pi -e ./src/index.ts` from the checkout.
 
 ## Use
 
-Suggestions start off. In Pi’s terminal UI, run `/heads-up on` to enable them for future sessions or `/heads-up off` to disable them. Run `/heads-up` to open the current note or manage the setting.
+Suggestions are on by default in Pi’s terminal UI. Run `/heads-up off` to disable them across sessions or `/heads-up on` to turn them back on. Run `/heads-up` to open the current note or manage the setting.
 
 When there is a note, **Learn more** opens the explanation. **Knew this already** and **Understood** record the topic as known. **Dismiss** closes the note. **Chat in main session** quotes the note in the Pi editor for you to edit and submit. Pi’s usual editor and keys handle every action.
 

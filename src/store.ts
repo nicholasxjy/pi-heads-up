@@ -51,7 +51,7 @@ export class Store {
 
   enabled(): boolean {
     const setting = this.open()?.prepare("SELECT enabled FROM settings WHERE key = 'heads-up'").get();
-    return setting?.enabled === 1;
+    return (setting?.enabled ?? 1) === 1;
   }
 
   setEnabled(enabled: boolean): void {
