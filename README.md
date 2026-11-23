@@ -22,9 +22,13 @@ When there is a note, **Learn more** opens the explanation. **Knew this already*
 
 ## Review behavior and data
 
-After six completed model rounds with tool results in a task, the extension can start one additional request alongside Pi’s next main model request. It uses the current model and its configured authentication. For a virtual model, it uses the physical model from the completed round. It pauses checks while another check is in flight or a note is open. The request has no tools, runs in the background, and counts toward the model’s usage or billing. Print, JSON, and RPC sessions skip the feature.
+After six completed model rounds with tool results in a task, the extension can review the work alongside Pi’s next main request. If a task finishes normally with at least three tool results and no earlier review, it can run one closing check. Three results from parallel calls in a single round qualify. Queued input, an open note, or a review in flight suppresses the closing check. Starting a new task clears the previous preview and keeps the editor draft and note history.
 
-The review request includes up to 20,000 characters of recent conversation, tool calls, and tool results, plus up to 50 recent notes. It takes the transcript after Pi runs its `context` hooks. Use that hook for redaction you want the review to inherit. The extension stores the enabled setting and note topics, titles, and known status in `~/.pi/agent/pi-heads-up/state.sqlite` (relative to `PI_CODING_AGENT_DIR` when set). Note records expire after 30 days and are cleaned up at startup or on the next check. With `--no-session`, the extension uses an in-memory note history for that session.
+Reviews use the current model and its configured authentication. For a virtual model, the review uses the physical model from the completed round. Each request runs in the background without tools and counts toward model usage or billing. Reviews run only in Pi’s terminal UI.
+
+Both checks use up to 20,000 characters from the conversation after Pi’s `context` hooks, plus up to 50 recent notes for the current project. The closing check uses the last filtered model input. Pi 1.6.0 exposes the final reply before a further filter pass, so the extension leaves that reply out. An oversized failed tool result keeps its beginning and final diagnostic within the 3,000-character message budget.
+
+The extension stores the global enabled setting and per-project note topics, titles, and known status in `~/.pi/agent/pi-heads-up/state.sqlite` (relative to `PI_CODING_AGENT_DIR` when set). Each Pi working directory has its own history. Note records expire after 30 days and are cleaned up at startup or on the next check. Records written by older versions have no project and expire without entering a review. With `--no-session`, the extension uses an in-memory note history for that session.
 
 ## Test
 

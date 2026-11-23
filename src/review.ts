@@ -10,6 +10,7 @@ export interface Note {
 
 const TRANSCRIPT_LIMIT = 20_000;
 const MESSAGE_LIMIT = 3_000;
+const TRUNCATED = "\n[truncated]\n";
 
 export const REVIEW_PROMPT = `You are a quiet, read-only reviewer of an ongoing coding session.
 Look for at most one consequential thing the user might miss. Prefer a specific overlooked decision, risk, surprising result, or unmet requirement (heads_up). Use you_should_know for a concept that materially changes how the user understands this task.
@@ -20,7 +21,16 @@ export function noteLabel(note: Note): string {
   return note.kind === "heads_up" ? "Heads up" : "You should know";
 }
 
-function messageText(message: Exclude<Message, { role: "system" }>): string {
+function messageText(message: Exclude<Message, { role: "system" }>, limit = MESSAGE_LIMIT): string {
+  if (message.role === "toolResult" && message.isError) {
+    const text = message.content.flatMap((part) => part.type === "text" && part.text ? [part.text] : []).join("\n").trim();
+    if (text.length <= limit) return text;
+    if (limit < 3) return text.slice(-limit);
+    const marker = limit >= TRUNCATED.length + 2 ? TRUNCATED : "…";
+    const available = limit - marker.length;
+    const head = Math.floor(available / 2);
+    return text.slice(0, head) + marker + text.slice(-(available - head));
+  }
   if (typeof message.content === "string") return message.content.slice(0, MESSAGE_LIMIT).trim();
   return message.content.map((part) => {
     if (part.type === "text") return part.text.slice(0, MESSAGE_LIMIT);
@@ -38,11 +48,13 @@ export function buildTranscript(messages: readonly Message[]): string {
   for (let index = messages.length - 1; index >= 0 && remaining > 2; index--) {
     const message = messages[index];
     if (message.role === "system") continue;
-    const text = messageText(message);
-    if (!text) continue;
     const label = message.role === "toolResult"
       ? `tool result (${message.toolName}${message.isError ? ", error" : ""})`
       : message.role;
+    const available = remaining - label.length - 4;
+    if (available <= 0) break;
+    const text = messageText(message, Math.min(MESSAGE_LIMIT, available));
+    if (!text) continue;
     const section = `${label}: ${text}`.slice(0, remaining - 2);
     sections.push(section);
     remaining -= section.length + 2;

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -117,19 +118,23 @@ interface SelectCall {
 
 async function createHarness(opts: {
   agentDir: string;
+  cwd?: string;
+  extensions?: string[];
   mode?: ExtensionContext["mode"];
   sessionFile?: string;
   model?: Model<Api>;
   physicalModel?: Model<Api>;
+  hasPendingMessages?: () => boolean;
   complete?: (model: Model<Api>, context: Context, options?: Record<string, unknown>) => Promise<AssistantMessage>;
   select?: (title: string, options: string[], opts?: ExtensionUIDialogOptions) => Promise<string | undefined>;
 }) {
-  const cwd = opts.agentDir;
+  const cwd = opts.cwd ?? opts.agentDir;
   process.env.PI_CODING_AGENT_DIR = opts.agentDir;
   const eventBus = createEventBus();
-  const loaded = await discoverAndLoadExtensions([REPO_ROOT], cwd, opts.agentDir, eventBus);
+  const paths = [REPO_ROOT, ...(opts.extensions ?? [])];
+  const loaded = await discoverAndLoadExtensions(paths, cwd, opts.agentDir, eventBus);
   assert.deepEqual(loaded.errors, []);
-  assert.equal(loaded.extensions.length, 1);
+  assert.equal(loaded.extensions.length, paths.length);
 
   const completeCalls: CompleteCall[] = [];
   const selectCalls: SelectCall[] = [];
@@ -181,7 +186,7 @@ async function createHarness(opts: {
       isProjectTrusted: () => true,
       getSignal: () => undefined,
       abort: () => {},
-      hasPendingMessages: () => false,
+      hasPendingMessages: opts.hasPendingMessages ?? (() => false),
       shutdown: () => {},
       getContextUsage: () => undefined,
       compact: () => {},
@@ -248,6 +253,7 @@ async function createHarness(opts: {
 
   async function emitToolTurn(overrides?: {
     toolResults?: ToolResultMessage[];
+    message?: AssistantMessage;
     outcome?: "completed" | "aborted" | "error";
     llmMessages?: Message[];
     boundaryMessages?: Message[];
@@ -257,7 +263,7 @@ async function createHarness(opts: {
       {
         type: "turn_end",
         turnIndex: 0,
-        message: assistantJson(null),
+        message: overrides?.message ?? assistantJson(null),
         toolResults: overrides?.toolResults ?? [toolResult()],
         messageEntryId: "m1",
         toolResultEntryIds: ["t1"],
@@ -280,8 +286,17 @@ async function createHarness(opts: {
     }
   }
 
+  async function finishTask(stopReason: AssistantMessage["stopReason"] = "stop", aborted = false) {
+    await emitToolTurn({
+      message: { ...assistantJson("UNFILTERED_FINAL"), stopReason },
+      toolResults: [], boundaryMessages: [toolResult("read", "UNFILTERED_BOUNDARY")], skipContext: true,
+    });
+    await runner.emit({ type: "agent_settled", aborted });
+  }
+
   return {
     runner,
+    finishTask,
     completeCalls,
     selectCalls,
     notifications,
@@ -292,6 +307,7 @@ async function createHarness(opts: {
       editorText = t;
     },
     runCommand,
+    startTask: () => runner.emitBeforeAgentStart({ messageType: "user", prompt: "next task" }, { cwd }),
     emitToolTurn,
     emitToolTurns,
   };
@@ -352,6 +368,66 @@ describe("pi-heads-up", { concurrency: false }, () => {
     await h2.runner.emit({ type: "session_shutdown", reason: "quit" });
   });
 
+  it("isolates note titles and duplicate topics by project while sharing the global setting", async () => {
+    const agentDir = makeTempDir();
+    const projectA = makeTempDir();
+    const projectB = makeTempDir();
+    const note = { kind: "heads_up", topic: "cache", title: "Project A diagnostic", detail: "Cache is stale." };
+    async function open(cwd: string, title: string) {
+      return createHarness({
+        agentDir, cwd, sessionFile: join(cwd, "session.jsonl"),
+        complete: async () => assistantJson({ ...note, title }),
+        select: async () => "Knew this already",
+      });
+    }
+    const a = await open(projectA, note.title);
+    await a.emitToolTurns(6);
+    await a.runCommand();
+    const b = await open(projectB, "Project B diagnostic");
+    await b.emitToolTurns(6);
+    assert.deepEqual(JSON.parse(String(b.completeCalls[0].context.messages[0].content)).recentNotes, []);
+    assert.ok(b.getCurrentWidget()?.includes("Project B diagnostic"));
+    await b.runCommand("off");
+    await a.emitToolTurns(6);
+    assert.equal(a.completeCalls.length, 1);
+    await b.runCommand("on");
+    await a.runner.emit({ type: "session_shutdown", reason: "quit" });
+    await b.runner.emit({ type: "session_shutdown", reason: "quit" });
+    const restarted = await open(projectA, note.title);
+    await restarted.emitToolTurns(6);
+    assert.deepEqual(JSON.parse(String(restarted.completeCalls[0].context.messages[0].content)).recentNotes, [
+      { topic: note.topic, title: note.title, known: 1 },
+    ]);
+    assert.equal(restarted.getCurrentWidget(), undefined);
+    await restarted.runner.emit({ type: "session_shutdown", reason: "quit" });
+  });
+
+  it("keeps legacy opt-out and expires unscoped notes without sending them to any project", async (t) => {
+    const agentDir = makeTempDir();
+    const dir = join(agentDir, "pi-heads-up");
+    mkdirSync(dir);
+    const db = new DatabaseSync(join(dir, "state.sqlite"));
+    t.after(() => db.close());
+    db.exec(`CREATE TABLE settings (key TEXT PRIMARY KEY, enabled INTEGER NOT NULL);
+      INSERT INTO settings VALUES ('heads-up', 0);
+      CREATE TABLE notes (topic TEXT PRIMARY KEY, title TEXT NOT NULL, known INTEGER NOT NULL, seen_at INTEGER NOT NULL);`);
+    let now = Date.now();
+    t.mock.method(Date, "now", () => now);
+    db.prepare("INSERT INTO notes VALUES (?, ?, 1, ?)").run("cache", "Legacy project title", now);
+    const h = await createHarness({ agentDir, sessionFile: join(agentDir, "session.jsonl") });
+    await h.emitToolTurns(3);
+    await h.finishTask();
+    assert.equal(h.completeCalls.length, 0);
+    await h.runCommand("on");
+    await h.emitToolTurns(6);
+    assert.deepEqual(JSON.parse(String(h.completeCalls[0].context.messages[0].content)).recentNotes, []);
+    assert.equal(db.prepare("SELECT title FROM notes").get()?.title, "Legacy project title");
+    now += RETENTION_MS;
+    await h.emitToolTurns(6);
+    assert.equal(db.prepare("SELECT * FROM notes").all().length, 0);
+    await h.runner.emit({ type: "session_shutdown", reason: "quit" });
+  });
+
   it("requires six completed tool-result turns in TUI and stays inert in print/RPC modes", async () => {
     const agentDir = makeTempDir();
 
@@ -360,10 +436,11 @@ describe("pi-heads-up", { concurrency: false }, () => {
     await setup.runCommand("on");
     await setup.runner.emit({ type: "session_shutdown", reason: "quit" });
 
-    for (const mode of ["print", "rpc"] as const) {
+    for (const mode of ["print", "json", "rpc"] as const) {
       const inert = await createHarness({ agentDir, mode });
       await inert.runner.emit({ type: "session_start", reason: "startup" });
       await inert.emitToolTurns(7);
+      await inert.finishTask();
       await inert.runCommand("off");
       await inert.runCommand();
       assert.equal(inert.completeCalls.length, 0, `${mode} mode should not call complete`);
@@ -453,6 +530,166 @@ describe("pi-heads-up", { concurrency: false }, () => {
     // While a note is visible, more tool turns do not start another review
     await h.emitToolTurns(6);
     assert.equal(h.completeCalls.length, 1);
+    await h.runner.emit({ type: "session_shutdown", reason: "quit" });
+  });
+
+  it("reviews one short settled task using only the last filtered evidence", async () => {
+    const physical = makeModel();
+    const response = deferred<AssistantMessage>();
+    const agentDir = makeTempDir();
+    const redactor = join(agentDir, "redactor.mjs");
+    writeFileSync(redactor, `export default function (pi) {
+      pi.on("context", (event) => ({ messages: event.messages.filter((m) => m.toolName !== "private") }));
+    }`);
+    const h = await createHarness({
+      agentDir, extensions: [redactor], model: { ...physical, api: "pi-virtual", id: "virtual" },
+      physicalModel: physical, complete: () => response.promise,
+    });
+    const results = [toolResult(), toolResult(), toolResult()];
+    await h.emitToolTurn({ toolResults: results, llmMessages: [toolResult("read", "EARLIER_SNAPSHOT")] });
+    await h.runner.emitContext([toolResult("read", "FILTERED_EVIDENCE"), toolResult("private", "PRIVATE_EVIDENCE")]);
+    assert.equal(h.completeCalls.length, 0);
+    await h.finishTask();
+    assert.equal(h.completeCalls.length, 1);
+    const call = h.completeCalls[0];
+    assert.equal(call.model, physical);
+    const { transcript } = JSON.parse(String(call.context.messages[0].content));
+    assert.equal(transcript, "tool result (read): FILTERED_EVIDENCE");
+    await h.runner.emit({ type: "agent_settled", aborted: false });
+    assert.equal(h.completeCalls.length, 1);
+    response.resolve(assistantJson({ kind: "heads_up", topic: "tests", title: "Only unit tests ran.", detail: "No integration run appeared." }));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(h.getCurrentWidget()?.includes("Only unit tests ran."));
+    await h.runner.emit({ type: "session_shutdown", reason: "quit" });
+  });
+
+  it("discards a closing review that returns after another task starts", async () => {
+    const late = deferred<AssistantMessage>();
+    const note = { kind: "heads_up", topic: "result", title: "Late task result", detail: "Only for the first task." };
+    const h = await createHarness({ agentDir: makeTempDir(), complete: () => late.promise });
+    await h.emitToolTurns(3);
+    await h.finishTask();
+    const signal = h.completeCalls[0].options?.signal as AbortSignal;
+    await h.startTask();
+    assert.ok(signal.aborted);
+    late.resolve(assistantJson(note));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(h.getCurrentWidget(), undefined);
+    await h.emitToolTurns(3);
+    await h.finishTask();
+    assert.deepEqual(JSON.parse(String(h.completeCalls[1].context.messages[0].content)).recentNotes, []);
+    assert.ok(h.getCurrentWidget()?.includes(note.title));
+    await h.runner.emit({ type: "session_shutdown", reason: "quit" });
+  });
+
+  it("skips closing checks for incomplete, queued, already reviewed and ineligible tasks", async () => {
+    const agentDir = makeTempDir();
+    let queued = false;
+    const h = await createHarness({ agentDir, hasPendingMessages: () => queued });
+    const start = h.startTask;
+    await h.emitToolTurns(2);
+    await h.finishTask();
+    assert.equal(h.completeCalls.length, 0);
+    for (const reason of ["error", "aborted", "length", "stop"] as const) {
+      await start();
+      await h.emitToolTurns(3);
+      await h.finishTask(reason, reason === "stop");
+      assert.equal(h.completeCalls.length, 0, reason);
+    }
+    await start();
+    await h.emitToolTurns(3);
+    queued = true;
+    await h.finishTask();
+    assert.equal(h.completeCalls.length, 0);
+    queued = false;
+    await start();
+    await h.emitToolTurns(6);
+    await h.finishTask();
+    assert.equal(h.completeCalls.length, 1);
+    await start();
+    await h.emitToolTurns(6);
+    await h.runCommand("off");
+    await h.runCommand("on");
+    await h.emitToolTurns(3);
+    await h.finishTask();
+    assert.equal(h.completeCalls.length, 2);
+    await start();
+    await h.emitToolTurns(3);
+    await h.finishTask();
+    assert.equal(h.completeCalls.length, 3);
+    await h.runner.emit({ type: "session_shutdown", reason: "quit" });
+  });
+
+  it("starts a queued follow-up with its own tool count when Pi drains the queue before settling", async () => {
+    const h = await createHarness({ agentDir: makeTempDir() });
+    await h.emitToolTurns(3);
+    await h.emitToolTurn({ toolResults: [], skipContext: true });
+    const followUp: Message = { role: "user", content: "A quick follow-up", timestamp: Date.now() };
+    await h.runner.emit({ type: "message_start", message: followUp });
+    await h.runner.emitContext([followUp]);
+    await h.finishTask();
+    assert.equal(h.completeCalls.length, 0);
+    await h.runner.emit({ type: "session_shutdown", reason: "quit" });
+  });
+
+  it("can run a closing check when a database writer prevented the mid-task request", async (t) => {
+    const agentDir = makeTempDir();
+    const h = await createHarness({ agentDir, sessionFile: join(agentDir, "task.jsonl") });
+    await h.runCommand("on");
+    const writer = new DatabaseSync(join(agentDir, "pi-heads-up", "state.sqlite"));
+    t.after(() => writer.close());
+    writer.exec("BEGIN IMMEDIATE");
+    await h.emitToolTurns(6);
+    assert.equal(h.completeCalls.length, 0);
+    writer.exec("ROLLBACK");
+    await h.finishTask();
+    assert.equal(h.completeCalls.length, 1);
+    await h.runner.emit({ type: "session_shutdown", reason: "quit" });
+  });
+
+  it("keeps both ends of long failed tool results within the per-message and transcript budgets", async () => {
+    const h = await createHarness({ agentDir: makeTempDir() });
+    const failure: ToolResultMessage = {
+      ...toolResult("bash"), isError: true,
+      content: [
+        { type: "text", text: "build src/main.ts\n" + "x".repeat(4000) },
+        { type: "text", text: "OMITTED_MIDDLE" },
+        { type: "text", text: "y".repeat(4000) + "\nE_EXIT at src/main.ts:12" },
+      ],
+    };
+    await h.emitToolTurns(6, [...Array<Message>(8).fill(toolResult("read", "a".repeat(3000))), failure]);
+    const { transcript } = JSON.parse(String(h.completeCalls[0].context.messages[0].content));
+    assert.ok(transcript.length <= 20_000);
+    const excerpt = transcript.split("tool result (bash, error): ").at(-1);
+    assert.ok(excerpt.startsWith("build src/main.ts\n"));
+    assert.ok(excerpt.endsWith("E_EXIT at src/main.ts:12"));
+    assert.ok(excerpt.includes("[truncated]") && !excerpt.includes("OMITTED_MIDDLE"));
+    assert.ok(excerpt.length <= 3000);
+    // These newer results leave 14 characters for the older failure.
+    const errorAtCutoff = { ...toolResult("bash", "H" + "x".repeat(3000) + "T"), isError: true };
+    await h.emitToolTurns(6, [errorAtCutoff, ...Array(5).fill(toolResult("bash", "b".repeat(3000))),
+      toolResult("bash", "b".repeat(1793))]);
+    const second = JSON.parse(String(h.completeCalls[1].context.messages[0].content)).transcript;
+    assert.match(second, /^tool result \(bash, error\): Hx*…x*T\n\n/);
+    await h.runner.emit({ type: "session_shutdown", reason: "quit" });
+  });
+
+  it("clears an ignored note at the next task, keeps the draft and dedupe, and accepts a fresh note", async () => {
+    let note = { kind: "heads_up", topic: "old", title: "Old task note", detail: "Old evidence" };
+    const h = await createHarness({ agentDir: makeTempDir(), complete: async () => assistantJson(note) });
+    await h.emitToolTurns(6);
+    assert.ok(h.getCurrentWidget()?.includes("Old task note"));
+    h.setEditorText("Existing draft");
+    await h.startTask();
+    assert.equal(h.getCurrentWidget(), undefined);
+    assert.equal(h.getEditorText(), "Existing draft");
+    await h.emitToolTurns(6);
+    assert.equal(h.completeCalls.length, 2);
+    assert.equal(h.getCurrentWidget(), undefined);
+    note = { ...note, topic: "fresh", title: "New task note" };
+    await h.emitToolTurns(6);
+    assert.ok(h.getCurrentWidget()?.includes("New task note"));
+    assert.equal(h.getEditorText(), "Existing draft");
     await h.runner.emit({ type: "session_shutdown", reason: "quit" });
   });
 

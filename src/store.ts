@@ -34,11 +34,13 @@ export class Store {
         PRAGMA busy_timeout = 250;
         PRAGMA secure_delete = ON;
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, enabled INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS notes (
-          topic TEXT PRIMARY KEY,
+        CREATE TABLE IF NOT EXISTS project_notes (
+          project TEXT NOT NULL,
+          topic TEXT NOT NULL,
           title TEXT NOT NULL,
           known INTEGER NOT NULL,
-          seen_at INTEGER NOT NULL
+          seen_at INTEGER NOT NULL,
+          PRIMARY KEY (project, topic)
         );
       `);
     } catch (error) {
@@ -62,30 +64,36 @@ export class Store {
   }
 
   prune(now = Date.now()): void {
-    this.open()?.prepare("DELETE FROM notes WHERE seen_at <= ?").run(now - RETENTION);
+    const db = this.open();
+    if (!db) return;
+    db.prepare("DELETE FROM project_notes WHERE seen_at <= ?").run(now - RETENTION);
+    // Older installs stored notes without a project. Only expire those rows.
+    if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'notes'").get()) {
+      db.prepare("DELETE FROM notes WHERE seen_at <= ?").run(now - RETENTION);
+    }
   }
 
-  recent(now = Date.now()): RecentNote[] {
+  recent(project: string, now = Date.now()): RecentNote[] {
     this.prune(now);
     return (this.open()?.prepare(`
-      SELECT topic, title, known FROM notes ORDER BY seen_at DESC LIMIT 50
-    `).all() ?? []) as RecentNote[];
+      SELECT topic, title, known FROM project_notes WHERE project = ? ORDER BY seen_at DESC LIMIT 50
+    `).all(project) ?? []) as RecentNote[];
   }
 
-  remember(note: Note, now = Date.now()): boolean {
+  remember(project: string, note: Note, now = Date.now()): boolean {
     const result = this.open(true).prepare(`
-      INSERT INTO notes VALUES (?, ?, 0, ?)
-      ON CONFLICT(topic) DO UPDATE SET title = excluded.title, known = 0, seen_at = excluded.seen_at
-      WHERE notes.seen_at <= ?
-    `).run(note.topic, note.title, now, now - RETENTION);
+      INSERT INTO project_notes VALUES (?, ?, ?, 0, ?)
+      ON CONFLICT(project, topic) DO UPDATE SET title = excluded.title, known = 0, seen_at = excluded.seen_at
+      WHERE project_notes.seen_at <= ?
+    `).run(project, note.topic, note.title, now, now - RETENTION);
     return result.changes === 1;
   }
 
-  markKnown(note: Note, now = Date.now()): void {
+  markKnown(project: string, note: Note, now = Date.now()): void {
     this.open(true).prepare(`
-      INSERT INTO notes VALUES (?, ?, 1, ?)
-      ON CONFLICT(topic) DO UPDATE SET known = 1, seen_at = excluded.seen_at
-    `).run(note.topic, note.title, now);
+      INSERT INTO project_notes VALUES (?, ?, ?, 1, ?)
+      ON CONFLICT(project, topic) DO UPDATE SET known = 1, seen_at = excluded.seen_at
+    `).run(project, note.topic, note.title, now);
   }
 
   close(): void {
