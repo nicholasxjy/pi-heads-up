@@ -3,9 +3,13 @@
   "version": "0.1.0",
   "description": "Background Heads Up and You should know suggestions for Pi",
   "type": "module",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "license": "MIT",
-  "files": ["src"],
+  "files": [
+    "src"
+  ],
   "engines": {
     "node": ">=22.19.0"
   },
@@ -15,9 +19,15 @@
     "@earendil-works/pi-tui": "*"
   },
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "typecheck": "tsc --noEmit"
   },
   "pi": {
-    "extensions": ["./src/index.ts"]
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2"
   }
 }

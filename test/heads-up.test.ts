@@ -17,7 +17,7 @@ import {
   type SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { REVIEW_PROMPT } from "../src/review.ts";
+import { CLOSING_REVIEW_PROMPT, REVIEW_PROMPT } from "../src/review.ts";
 
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
@@ -124,9 +124,12 @@ async function createHarness(opts: {
   sessionFile?: string;
   model?: Model<Api>;
   physicalModel?: Model<Api>;
+  availableModels?: Model<Api>[];
+  hasConfiguredAuth?: (model: Model<Api>) => boolean;
   hasPendingMessages?: () => boolean;
   complete?: (model: Model<Api>, context: Context, options?: Record<string, unknown>) => Promise<AssistantMessage>;
   select?: (title: string, options: string[], opts?: ExtensionUIDialogOptions) => Promise<string | undefined>;
+  confirm?: (title: string, message: string, opts?: ExtensionUIDialogOptions) => Promise<boolean>;
 }) {
   const cwd = opts.cwd ?? opts.agentDir;
   process.env.PI_CODING_AGENT_DIR = opts.agentDir;
@@ -138,21 +141,28 @@ async function createHarness(opts: {
 
   const completeCalls: CompleteCall[] = [];
   const selectCalls: SelectCall[] = [];
+  const confirmCalls: Array<{ title: string; message: string; opts: ExtensionUIDialogOptions | undefined }> = [];
   const notifications: Array<{ message: string; type?: "info" | "warning" | "error" }> = [];
   const sentMessages: unknown[] = [];
   let editorText = "";
   let renderWidget: ((width: number) => string) | undefined;
 
   const model = opts.model ?? makeModel();
+  const knownModels = [
+    ...(opts.physicalModel ? [opts.physicalModel] : []),
+    ...(opts.availableModels ?? []),
+  ];
   const modelRegistry = {
     find: (provider: string, id: string) => {
-      const physical = opts.physicalModel;
-      return physical?.provider === provider && physical.id === id ? physical : undefined;
+      return knownModels.find((m) => m.provider === provider && m.id === id);
     },
-    complete: async (m: Model<Api>, context: Context, options?: Record<string, unknown>) => {
+    getAvailable: () => opts.availableModels ?? (opts.physicalModel ? [opts.physicalModel] : [model]),
+    hasConfiguredAuth: (m: Model<Api>) => (opts.hasConfiguredAuth ? opts.hasConfiguredAuth(m) : true),
+    streamSimple: (m: Model<Api>, context: Context, options?: Record<string, unknown>) => {
       completeCalls.push({ model: m, context, options });
-      if (opts.complete) return opts.complete(m, context, options);
-      return assistantJson(null);
+      return {
+        result: async () => (opts.complete ? opts.complete(m, context, options) : assistantJson(null)),
+      };
     },
   } as unknown as ModelRegistry;
 
@@ -200,7 +210,10 @@ async function createHarness(opts: {
       selectCalls.push({ title, options, opts: dialogOpts });
       return opts.select ? opts.select(title, options, dialogOpts) : undefined;
     },
-    confirm: async () => false,
+    confirm: async (title, message, dialogOpts) => {
+      confirmCalls.push({ title, message, opts: dialogOpts });
+      return opts.confirm ? opts.confirm(title, message, dialogOpts) : false;
+    },
     input: async () => undefined,
     notify: (message, type) => {
       notifications.push({ message, type });
@@ -299,6 +312,7 @@ async function createHarness(opts: {
     finishTask,
     completeCalls,
     selectCalls,
+    confirmCalls,
     notifications,
     sentMessages,
     getCurrentWidget: (width = 120) => renderWidget?.(width),
@@ -306,6 +320,8 @@ async function createHarness(opts: {
     setEditorText: (t: string) => {
       editorText = t;
     },
+    getCommandCompletions: async (prefix: string) =>
+      (await runner.getCommand("heads-up")?.getArgumentCompletions?.(prefix)) ?? null,
     runCommand,
     startTask: () => runner.emitBeforeAgentStart({ messageType: "user", prompt: "next task" }, { cwd }),
     emitToolTurn,
@@ -337,11 +353,19 @@ describe("pi-heads-up", { concurrency: false }, () => {
     assert.equal(existsSync(dbPath), false);
 
     await h1.runCommand("invalid");
-    assert.deepEqual(h1.notifications.at(-1), { message: "Usage: /heads-up [on|off]", type: "warning" });
+    assert.deepEqual(h1.notifications.at(-1), {
+      message: "Usage: /heads-up [on|off|status|model [provider/id|auto]|history|clear]",
+      type: "warning",
+    });
 
     await h1.runCommand();
     assert.equal(h1.selectCalls.at(-1)?.title, "Heads Up is on · No note to review");
-    assert.deepEqual(h1.selectCalls.at(-1)?.options, ["Turn off suggestions"]);
+    assert.deepEqual(h1.selectCalls.at(-1)?.options, [
+      "Turn off suggestions",
+      "View status",
+      "Configure review model",
+      "View project history",
+    ]);
 
     await h1.runCommand("off");
     assert.deepEqual(h1.notifications.at(-1), { message: "Heads Up disabled", type: "info" });
@@ -359,7 +383,12 @@ describe("pi-heads-up", { concurrency: false }, () => {
 
     await h2.runCommand();
     assert.equal(h2.selectCalls.at(-1)?.title, "Heads Up is off");
-    assert.deepEqual(h2.selectCalls.at(-1)?.options, ["Turn on suggestions"]);
+    assert.deepEqual(h2.selectCalls.at(-1)?.options, [
+      "Turn on suggestions",
+      "View status",
+      "Configure review model",
+      "View project history",
+    ]);
 
     await h2.runCommand("on");
     assert.deepEqual(h2.notifications.at(-1), { message: "Heads Up enabled", type: "info" });
@@ -423,8 +452,8 @@ describe("pi-heads-up", { concurrency: false }, () => {
     assert.deepEqual(JSON.parse(String(h.completeCalls[0].context.messages[0].content)).recentNotes, []);
     assert.equal(db.prepare("SELECT title FROM notes").get()?.title, "Legacy project title");
     now += RETENTION_MS;
-    await h.emitToolTurns(6);
-    assert.equal(db.prepare("SELECT * FROM notes").all().length, 0);
+    await h.runner.emit({ type: "session_start", reason: "startup" });
+    assert.equal(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'notes'").get(), undefined);
     await h.runner.emit({ type: "session_shutdown", reason: "quit" });
   });
 
@@ -533,7 +562,7 @@ describe("pi-heads-up", { concurrency: false }, () => {
     await h.runner.emit({ type: "session_shutdown", reason: "quit" });
   });
 
-  it("reviews one short settled task using only the last filtered evidence", async () => {
+  it("reviews one short settled task using filtered evidence and final assistant reply", async () => {
     const physical = makeModel();
     const response = deferred<AssistantMessage>();
     const agentDir = makeTempDir();
@@ -553,8 +582,9 @@ describe("pi-heads-up", { concurrency: false }, () => {
     assert.equal(h.completeCalls.length, 1);
     const call = h.completeCalls[0];
     assert.equal(call.model, physical);
+    assert.equal(call.context.systemPrompt, CLOSING_REVIEW_PROMPT);
     const { transcript } = JSON.parse(String(call.context.messages[0].content));
-    assert.equal(transcript, "tool result (read): FILTERED_EVIDENCE");
+    assert.equal(transcript, 'tool result (read): FILTERED_EVIDENCE\n\nFinal assistant reply: "UNFILTERED_FINAL"');
     await h.runner.emit({ type: "agent_settled", aborted: false });
     assert.equal(h.completeCalls.length, 1);
     response.resolve(assistantJson({ kind: "heads_up", topic: "tests", title: "Only unit tests ran.", detail: "No integration run appeared." }));
@@ -612,11 +642,11 @@ describe("pi-heads-up", { concurrency: false }, () => {
     await h.runCommand("on");
     await h.emitToolTurns(3);
     await h.finishTask();
-    assert.equal(h.completeCalls.length, 2);
+    assert.equal(h.completeCalls.length, 3);
     await start();
     await h.emitToolTurns(3);
     await h.finishTask();
-    assert.equal(h.completeCalls.length, 3);
+    assert.equal(h.completeCalls.length, 4);
     await h.runner.emit({ type: "session_shutdown", reason: "quit" });
   });
 
@@ -632,7 +662,7 @@ describe("pi-heads-up", { concurrency: false }, () => {
     await h.runner.emit({ type: "session_shutdown", reason: "quit" });
   });
 
-  it("can run a closing check when a database writer prevented the mid-task request", async (t) => {
+  it("allows mid-task read-only history checks alongside an active database writer", async (t) => {
     const agentDir = makeTempDir();
     const h = await createHarness({ agentDir, sessionFile: join(agentDir, "task.jsonl") });
     await h.runCommand("on");
@@ -640,7 +670,7 @@ describe("pi-heads-up", { concurrency: false }, () => {
     t.after(() => writer.close());
     writer.exec("BEGIN IMMEDIATE");
     await h.emitToolTurns(6);
-    assert.equal(h.completeCalls.length, 0);
+    assert.equal(h.completeCalls.length, 1);
     writer.exec("ROLLBACK");
     await h.finishTask();
     assert.equal(h.completeCalls.length, 1);
@@ -922,5 +952,154 @@ describe("pi-heads-up", { concurrency: false }, () => {
     await hReset.emitToolTurns(6);
     assert.ok(hReset.getCurrentWidget()?.includes("Surfaces after reset."));
     await hReset.runner.emit({ type: "session_shutdown", reason: "quit" });
+  });
+
+  it("sizes reasoning model budget and clamps thinking level via streamSimple", async () => {
+    const canDisableThinking: Model<Api> = { ...makeModel(4096), id: "think-opt", reasoning: true };
+    const h1 = await createHarness({ agentDir: makeTempDir(), model: canDisableThinking });
+    await h1.emitToolTurns(6);
+    assert.equal(h1.completeCalls[0].options?.maxTokens, 2048);
+    assert.equal("reasoning" in (h1.completeCalls[0].options ?? {}), false);
+    await h1.runner.emit({ type: "session_shutdown", reason: "quit" });
+
+    const mustThink: Model<Api> = {
+      ...makeModel(1500),
+      id: "think-forced",
+      reasoning: true,
+      thinkingLevelMap: { off: null },
+    };
+    const h2 = await createHarness({ agentDir: makeTempDir(), model: mustThink });
+    await h2.emitToolTurns(6);
+    assert.equal(h2.completeCalls[0].options?.maxTokens, 1500);
+    assert.equal(h2.completeCalls[0].options?.reasoning, "minimal");
+    await h2.runner.emit({ type: "session_shutdown", reason: "quit" });
+  });
+
+  it("does not block closing checks when mid-task review fails and re-checks long tasks with new tool work", async () => {
+    let callCount = 0;
+    const h = await createHarness({
+      agentDir: makeTempDir(),
+      complete: async () => {
+        callCount++;
+        if (callCount === 1) throw new Error("transient failure");
+        if (callCount === 2) return assistantJson(null);
+        if (callCount === 3) return assistantJson(null);
+        return assistantJson({
+          kind: "heads_up",
+          topic: "closing-check",
+          title: "Claimed tests passed without running them.",
+          detail: "Only read calls appeared after the mid-task review.",
+        });
+      },
+    });
+    await h.emitToolTurns(6);
+    await h.finishTask();
+    // Call 1 failed mid-task; Call 2 ran as closing check because resultsSinceReview was preserved.
+    assert.equal(h.completeCalls.length, 2);
+
+    // Long task: mid-task review succeeds (Call 3), then 3 more tool turns trigger closing check (Call 4).
+    await h.startTask();
+    await h.emitToolTurns(6);
+    await h.emitToolTurns(3);
+    await h.finishTask();
+    assert.equal(h.completeCalls.length, 4);
+    assert.ok(h.getCurrentWidget()?.includes("Claimed tests passed without running them."));
+    await h.runner.emit({ type: "session_shutdown", reason: "quit" });
+  });
+
+  it("supports status diagnostics, custom review model, history management, clear, and completions", async () => {
+    const agentDir = makeTempDir();
+    const sessionModel = makeModel(4096);
+    const customModel: Model<Api> = { ...makeModel(8192), provider: "anthropic", id: "claude-haiku-4", name: "Claude Haiku 4" };
+    const noAuthModel: Model<Api> = { ...makeModel(8192), provider: "openai", id: "gpt-noauth", name: "No Auth" };
+    let selectQueue: string[] = [];
+    let confirmResult = false;
+    let throwOnReview = false;
+
+    const h = await createHarness({
+      agentDir,
+      sessionFile: join(agentDir, "session.jsonl"),
+      model: sessionModel,
+      availableModels: [sessionModel, customModel, noAuthModel],
+      hasConfiguredAuth: (m) => m.id !== "gpt-noauth",
+      select: async () => selectQueue.shift(),
+      confirm: async () => confirmResult,
+      complete: async () => {
+        if (throwOnReview) throw new Error("boom");
+        return assistantJson({
+          kind: "heads_up",
+          topic: "custom-model-note",
+          title: "Reviewed by custom model.",
+          detail: "Detected an overlooked edge case.",
+        });
+      },
+    });
+    await h.runner.emit({ type: "session_start", reason: "startup" });
+
+    const topCompletions = (await h.getCommandCompletions("")) ?? [];
+    assert.deepEqual(
+      topCompletions.map((c) => c.value),
+      ["on", "off", "status", "model", "history", "clear"],
+    );
+    const modelCompletions = (await h.getCommandCompletions("model haiku")) ?? [];
+    assert.deepEqual(modelCompletions.map((c) => c.value), ["model anthropic/claude-haiku-4"]);
+
+    await h.runCommand("model openai/gpt-noauth");
+    assert.equal(h.notifications.at(-1)?.type, "warning");
+    assert.ok(h.notifications.at(-1)?.message.includes("No configured auth"));
+
+    await h.runCommand("model anthropic/claude-haiku-4");
+    assert.ok(h.notifications.at(-1)?.message.includes("anthropic/claude-haiku-4"));
+
+    await h.emitToolTurns(6);
+    assert.equal(h.completeCalls[0].model, customModel);
+
+    // Dismiss note, then manage it via /heads-up history
+    selectQueue = ["Dismiss"];
+    await h.runCommand();
+    selectQueue = ["[unseen] custom-model-note · Reviewed by custom model.", "Mark as known"];
+    await h.runCommand("history");
+    assert.ok(h.notifications.at(-1)?.message.includes("Marked 'custom-model-note' as known"));
+
+    // Simulate review error and inspect /heads-up status
+    await h.startTask();
+    throwOnReview = true;
+    await h.emitToolTurns(6);
+    await h.runCommand("status");
+    const statusText = h.notifications.at(-1)?.message ?? "";
+    assert.ok(statusText.includes("Heads Up: on"));
+    assert.ok(statusText.includes("anthropic/claude-haiku-4 (custom)"));
+    assert.ok(statusText.includes("1 note(s), 1 known"));
+    assert.ok(statusText.includes("error (boom)"));
+
+    // Reset review model to auto and clear project history
+    await h.runCommand("model auto");
+    confirmResult = true;
+    await h.runCommand("clear");
+    assert.equal(h.confirmCalls.length, 1);
+    assert.ok(h.notifications.at(-1)?.message.includes("Cleared 1 note(s)"));
+
+    await h.runner.emit({ type: "session_shutdown", reason: "quit" });
+
+    // Restart persists custom review model when set interactively
+    const h2 = await createHarness({
+      agentDir,
+      sessionFile: join(agentDir, "session.jsonl"),
+      model: sessionModel,
+      availableModels: [sessionModel, customModel],
+      select: async () => "anthropic/claude-haiku-4",
+    });
+    await h2.runCommand("model");
+    await h2.runner.emit({ type: "session_shutdown", reason: "quit" });
+
+    const h3 = await createHarness({
+      agentDir,
+      sessionFile: join(agentDir, "session.jsonl"),
+      model: sessionModel,
+      availableModels: [sessionModel, customModel],
+    });
+    await h3.emitToolTurns(6);
+    assert.equal(h3.completeCalls[0].model, customModel);
+    await h3.runner.emit({ type: "session_shutdown", reason: "quit" });
   });
 });
